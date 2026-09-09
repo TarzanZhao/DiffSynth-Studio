@@ -115,6 +115,8 @@ def FlowMatchSFTMiniMaxH3AudioVideoLoss(pipe: BasePipeline, training_cfg_scale: 
         loss_audio = torch.nn.functional.mse_loss(noise_pred_audio.float(), training_target_audio.float())
         loss_audio = loss_audio * pipe.scheduler_audio.training_weight(timestep_audio) * audio_loss_weight
         loss = loss + loss_audio
+    from .tpa_hooks import loss_checkpoints   # correctness checkpoints; no-op unless PROBE=1
+    loss_checkpoints(timestep_video, inputs, noise_pred, noise_pred_audio if "audio_input_latents" in inputs else None, loss)
     return loss
 
 

@@ -4,6 +4,7 @@ from accelerate import Accelerator
 from .training_module import DiffusionTrainingModule
 from .logger import ModelLogger
 from diffsynth.core import OffloadTrainingManager
+from .tpa_hooks import StepHooks
 
 
 def get_optimizer_class(customized_optimizer=None):
@@ -96,24 +97,29 @@ def launch_training_task(
         model, optimizer, dataloader, scheduler = accelerator.prepare(model, optimizer, dataloader, scheduler)
 
     initialize_deepspeed_gradient_checkpointing(accelerator)
+    hooks = StepHooks(accelerator, model)   # measurement only; no-op unless TPA_*/PROBE env vars are set
     for epoch_id in range(num_epochs):
         for data in tqdm(dataloader):
+            hooks.step_begin()
             with accelerator.accumulate(model):
                 if dataset.load_from_cache:
                     loss = model({}, inputs=data)
                 else:
                     loss = model(data)
                 accelerator.backward(loss)
+                hooks.after_backward(loss)
                 if enable_model_cpu_offload:
                     offload_manager.after_backward()
                 optimizer.step()
                 scheduler.step()
                 optimizer.zero_grad()
+                hooks.after_step()
                 model_logger.on_step_end(accelerator, model, save_steps, loss=loss)
         if save_steps is None:
             model_logger.on_epoch_end(accelerator, model, epoch_id)
 
     model_logger.on_training_end(accelerator, model, save_steps)
+    hooks.end()
 
 
 def launch_data_process_task(
