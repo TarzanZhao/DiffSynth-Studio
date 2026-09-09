@@ -11,13 +11,17 @@ import os, time, json, itertools
 _T0 = time.time()                       # import time ~ process start, for the startup cost
 
 # Tolerances, from `probe derive` over 3 runs x 8 ranks of the unmodified code (bf16, FA2 backward atomics,
-# bf16 LoRA params under AdamW): roughly 3x the largest spread seen per family. The step-1 gradient is the
-# clean test of the backward pass (identical params on every run); later grad norms are chaotic in the
-# baseline itself (up to 8x between identical runs) and only gate against NaN/blow-up.
+# bf16 LoRA params under AdamW): roughly 3x the largest spread seen per family.
+# Gradients: the total LoRA grad norm is not a usable gate. From step 2 on it swings up to 8x between
+# identical runs (bf16 params diverge by rounding). At step 1 (identical params) it is reproducible for one
+# kernel set, but four correct attention kernels (FA2, cuDNN, torch flash, mem-efficient; pairwise 0.3% per
+# call) give 0.041..0.096, with per-block cosine ~0 for blocks 0-28: the end-to-end bf16 backward loses the
+# gradient signal after ~20 blocks. Blocks 40-49 are stable across kernels (cosine >= 0.987, norm within
+# 2.7%), so `gradtail_step1` gates the backward pass and the totals are record-only (NaN / blow-up).
 TOL = {
     "noisepred_absmean": dict(rtol=2e-2), "noisepred_audio_absmean": dict(rtol=2.5e-2),
     "loss": dict(rtol=0.15, atol=0.03), "lora_sqsum": dict(rtol=1.5e-2),
-    "gradnorm_step1": dict(rtol=6e-2), "gradnorm": dict(rtol=20.0),
+    "gradnorm": dict(rtol=20.0), "gradtail_step1": dict(rtol=0.10),
     "final_absmean_A": dict(rtol=2e-2), "final_absmean_B": dict(atol=4e-4),
 }
 _loss_step = itertools.count(1)
@@ -94,7 +98,8 @@ class StepHooks:
                 on_trace_ready=on_ready, record_shapes=False, profile_memory=False, with_stack=False)
             self.prof.start()
         if self.steptime_out or probe_on():
-            self._params = [p for p in accelerator.unwrap_model(model).parameters() if p.requires_grad]
+            self._named_params = [(n, p) for n, p in accelerator.unwrap_model(model).named_parameters() if p.requires_grad]
+            self._params = [p for _, p in self._named_params]
         self.t_ready = time.time()
 
     # -- per step -------------------------------------------------------------
@@ -107,13 +112,22 @@ class StepHooks:
             self._ev[0].record()
 
     def after_backward(self, loss):
+        dump = os.environ.get("TPA_DUMP_GRADS")
+        if dump and self.step == 1 and self.rank == 0:   # step-1 LoRA gradients, for offline comparison
+            m = self.accelerator.unwrap_model(self.model)
+            self.torch.save({n: p.grad.detach().float().cpu() for n, p in m.named_parameters() if p.grad is not None}, dump)
         if probe_on():
             torch = self.torch
             grads = [p.grad for p in self._params if p.grad is not None]
             if grads:
                 norm = torch.linalg.vector_norm(torch.stack([torch.linalg.vector_norm(g.float()) for g in grads]))
-                record(f"gradnorm_step{self.step}", norm.item(), **TOL["gradnorm_step1" if self.step == 1 else "gradnorm"])
+                record(f"gradnorm_step{self.step}", norm.item(), **TOL["gradnorm"])
             record(f"n_grads_step{self.step}", len(grads))
+            if self.step == 1:
+                tail = [p.grad for n, p in self._named_params if p.grad is not None and _tail_block(n)]
+                if tail:
+                    tnorm = torch.linalg.vector_norm(torch.stack([torch.linalg.vector_norm(g.float()) for g in tail]))
+                    record("gradtail_step1", tnorm.item(), **TOL["gradtail_step1"])
 
     def after_step(self):
         torch = self.torch
@@ -155,6 +169,17 @@ class StepHooks:
             }
             with open(os.path.join(self.steptime_out, f"steptimes.rank{self.rank}.json"), "w") as f:
                 json.dump(out, f, indent=1)
+
+
+def _tail_block(name, first=40):
+    """LoRA tensors of DiT blocks >= `first` (the last 10 of 50): the part of the step-1 gradient that is
+    stable across correct kernels (see TOL)."""
+    if "token_refiner" in name or ".blocks." not in name:
+        return False
+    try:
+        return int(name.split(".blocks.")[1].split(".")[0]) >= first
+    except ValueError:
+        return False
 
 
 def _rss_gb():
