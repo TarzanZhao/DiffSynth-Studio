@@ -9,6 +9,17 @@ unless its env var is set, so the timed benchmark run pays nothing.
 import os, time, json, itertools
 
 _T0 = time.time()                       # import time ~ process start, for the startup cost
+
+# Tolerances, from `probe derive` over 3 runs x 8 ranks of the unmodified code (bf16, FA2 backward atomics,
+# bf16 LoRA params under AdamW): roughly 3x the largest spread seen per family. The step-1 gradient is the
+# clean test of the backward pass (identical params on every run); later grad norms are chaotic in the
+# baseline itself (up to 8x between identical runs) and only gate against NaN/blow-up.
+TOL = {
+    "noisepred_absmean": dict(rtol=2e-2), "noisepred_audio_absmean": dict(rtol=2.5e-2),
+    "loss": dict(rtol=0.15, atol=0.03), "lora_sqsum": dict(rtol=1.5e-2),
+    "gradnorm_step1": dict(rtol=6e-2), "gradnorm": dict(rtol=20.0),
+    "final_absmean_A": dict(rtol=2e-2), "final_absmean_B": dict(atol=4e-4),
+}
 _loss_step = itertools.count(1)
 
 try:
@@ -47,10 +58,10 @@ def loss_checkpoints(timestep_video, inputs, noise_pred, noise_pred_audio, loss)
             v = inputs.get(k)
             if hasattr(v, "shape"):
                 record(f"shape_{k}", str(tuple(v.shape)))
-    record_lazy(f"noisepred_absmean_step{s}", lambda: noise_pred.detach().float().abs().mean().item(), rtol=2e-2)
+    record_lazy(f"noisepred_absmean_step{s}", lambda: noise_pred.detach().float().abs().mean().item(), **TOL["noisepred_absmean"])
     if noise_pred_audio is not None:
-        record_lazy(f"noisepred_audio_absmean_step{s}", lambda: noise_pred_audio.detach().float().abs().mean().item(), rtol=2e-2)
-    record_lazy(f"loss_step{s}", lambda: loss.detach().float().item(), rtol=2e-2)
+        record_lazy(f"noisepred_audio_absmean_step{s}", lambda: noise_pred_audio.detach().float().abs().mean().item(), **TOL["noisepred_audio_absmean"])
+    record_lazy(f"loss_step{s}", lambda: loss.detach().float().item(), **TOL["loss"])
 
 
 class StepHooks:
@@ -101,14 +112,14 @@ class StepHooks:
             grads = [p.grad for p in self._params if p.grad is not None]
             if grads:
                 norm = torch.linalg.vector_norm(torch.stack([torch.linalg.vector_norm(g.float()) for g in grads]))
-                record(f"gradnorm_step{self.step}", norm.item(), rtol=2e-2)
+                record(f"gradnorm_step{self.step}", norm.item(), **TOL["gradnorm_step1" if self.step == 1 else "gradnorm"])
             record(f"n_grads_step{self.step}", len(grads))
 
     def after_step(self):
         torch = self.torch
         if probe_on():
             sq = sum((p.detach().float() ** 2).sum() for p in self._params)
-            record(f"lora_sqsum_step{self.step}", sq.item(), rtol=1e-3)
+            record(f"lora_sqsum_step{self.step}", sq.item(), **TOL["lora_sqsum"])
         if self.steptime_out:
             self._ev[1].record()
             self._ev[1].synchronize()
@@ -128,7 +139,7 @@ class StepHooks:
             m = self.accelerator.unwrap_model(self.model)
             for name, p in m.named_parameters():
                 if p.requires_grad:
-                    record(f"final_absmean/{name}", p.detach().float().abs().mean().item(), rtol=1e-3)
+                    record(f"final_absmean/{name}", p.detach().float().abs().mean().item(), **TOL["final_absmean_B" if "lora_B" in name else "final_absmean_A"])
             _probe.flush()
         if self.prof is not None:
             self.prof.stop()
